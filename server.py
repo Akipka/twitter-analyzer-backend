@@ -410,7 +410,7 @@ def demo_response(username: str, window_days: int) -> dict[str, Any]:
     profile = {
         "id": str(abs(hash(username)) % 10**18),
         "userName": username,
-        "displayName": username.replace("_", " ").title() + " (demo)",
+        "displayName": username.replace("_", " ") + " (demo)",
         "avatarUrl": _demo_avatar_url(username),
         "coverUrl": "",
         "description": "Synthetic profile — demo mode.",
