@@ -454,6 +454,73 @@ def health() -> Any:
     return jsonify({"ok": True, "has_key": bool(API_KEY), "demo_fallback": DEMO_FALLBACK})
 
 
+# Tiny in-process LRU cache for avatar bytes. Avatars rarely change, and the
+# upstream (unavatar.io) is rate-limited / occasionally slow. Cache size and
+# TTL are intentionally small so memory stays bounded on Render's free tier.
+_AVATAR_CACHE: dict[str, tuple[float, bytes, str]] = {}
+_AVATAR_CACHE_MAX = 256
+_AVATAR_CACHE_TTL = 60 * 60 * 6  # 6 hours
+
+
+@app.get("/api/avatar/<username>")
+def avatar(username: str) -> Any:
+    """Proxy a user's X profile avatar with proper CORS so the frontend can
+    embed it in html2canvas-rendered images. Falls back to a 1x1 transparent
+    PNG on failure so the frontend's local initials avatar can take over."""
+    from flask import Response
+
+    username = username.strip().lstrip("@").lower()
+    if not USERNAME_RE.match(username):
+        return jsonify({"error": "invalid_username"}), 400
+
+    now = time.time()
+    cached = _AVATAR_CACHE.get(username)
+    if cached and now - cached[0] < _AVATAR_CACHE_TTL:
+        _, body, content_type = cached
+        return Response(
+            body,
+            mimetype=content_type,
+            headers={
+                "Cache-Control": "public, max-age=21600",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    upstream = f"https://unavatar.io/twitter/{username}"
+    try:
+        r = requests.get(upstream, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        if r.status_code != 200 or not r.content:
+            raise RuntimeError(f"unavatar status {r.status_code}")
+        content_type = r.headers.get("Content-Type", "image/png").split(";")[0].strip()
+        if not content_type.startswith("image/"):
+            content_type = "image/png"
+        body = r.content
+    except Exception as exc:  # noqa: BLE001
+        # Any upstream error → 404 so the frontend's onError fires and the
+        # local initials-avatar takes over.
+        log.info("avatar proxy upstream error for %s: %s", username, exc)
+        return Response(
+            "",
+            status=404,
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    if len(_AVATAR_CACHE) >= _AVATAR_CACHE_MAX:
+        # cheap eviction: drop the oldest entry
+        oldest = min(_AVATAR_CACHE.items(), key=lambda kv: kv[1][0])[0]
+        _AVATAR_CACHE.pop(oldest, None)
+    _AVATAR_CACHE[username] = (now, body, content_type)
+
+    return Response(
+        body,
+        mimetype=content_type,
+        headers={
+            "Cache-Control": "public, max-age=21600",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
 @app.get("/api/analyze/<username>")
 def analyze(username: str) -> Any:
     started = time.time()
