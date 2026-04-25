@@ -376,10 +376,12 @@ def shape_profile(p: dict[str, Any]) -> dict[str, Any]:
 # ── Demo data (used when upstream is out of credits) ───────────────────────
 
 
-def _demo_avatar_url(username: str) -> str:
-    # unavatar.io fetches the public Twitter/X avatar by handle (no auth needed)
-    # and falls back to a generic placeholder if the user doesn't exist.
-    return f"https://unavatar.io/twitter/{username}?fallback=https%3A%2F%2Fabs.twimg.com%2Fsticky%2Fdefault_profile_images%2Fdefault_profile_400x400.png"
+def _demo_avatar_url(_username: str) -> str:
+    # In demo mode we leave the avatar empty and let the frontend render an
+    # SVG initials avatar (deterministic per username, in our color palette).
+    # We tried unavatar.io previously, but it was unreliable / rate-limited,
+    # which is bad UX for a synthetic-data screen.
+    return ""
 
 
 def _seeded_rng(username: str) -> random.Random:
