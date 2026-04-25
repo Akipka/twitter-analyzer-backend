@@ -21,7 +21,6 @@ import logging
 import os
 import re
 import time
-from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -35,14 +34,18 @@ from flask_cors import CORS
 API_KEY = os.environ.get("TWITTERAPI_IO_KEY", "").strip()
 API_BASE = "https://api.twitterapi.io"
 
-# Hard cap to keep cost predictable: ~$0.075 per analysis at $0.15/1k tweets.
-MAX_TWEETS = int(os.environ.get("MAX_TWEETS", "500"))
+# Hard cap on tweets per analysis. Each page returns 20.
+# Default 200 fits the free-tier 5s/req cooldown inside Render's 60s timeout.
+MAX_TWEETS = int(os.environ.get("MAX_TWEETS", "200"))
 
-# Window for stats (days). Older tweets are still fetched but ignored in stats.
+# Window for stats (days). Older tweets stop pagination once we've covered it.
 WINDOW_DAYS = int(os.environ.get("WINDOW_DAYS", "30"))
 
 # Per-request HTTP timeout to twitterapi.io.
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "20"))
+
+# twitterapi.io free tier enforces 1 request every 5s. Override on paid plans.
+MIN_REQUEST_INTERVAL = float(os.environ.get("MIN_REQUEST_INTERVAL", "5.2"))
 
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*")
 
@@ -65,6 +68,25 @@ def _headers() -> dict[str, str]:
     return {"X-API-Key": API_KEY, "Accept": "application/json"}
 
 
+_last_request_at: float = 0.0
+
+
+def _rate_limited_get(url: str, params: dict[str, Any]) -> requests.Response:
+    """GET that respects MIN_REQUEST_INTERVAL and retries once on HTTP 429."""
+    global _last_request_at
+    wait = MIN_REQUEST_INTERVAL - (time.time() - _last_request_at)
+    if wait > 0:
+        time.sleep(wait)
+    r = requests.get(url, params=params, headers=_headers(), timeout=HTTP_TIMEOUT)
+    _last_request_at = time.time()
+    if r.status_code == 429:
+        # backoff a little longer than the documented interval, retry once
+        time.sleep(MIN_REQUEST_INTERVAL + 1.0)
+        r = requests.get(url, params=params, headers=_headers(), timeout=HTTP_TIMEOUT)
+        _last_request_at = time.time()
+    return r
+
+
 def _parse_twitter_date(s: str) -> datetime | None:
     """Parse 'Thu Dec 13 08:41:26 +0000 2007' or ISO-ish formats."""
     if not s:
@@ -80,17 +102,49 @@ def _parse_twitter_date(s: str) -> datetime | None:
     return None
 
 
+class UpstreamError(Exception):
+    """Raised when twitterapi.io returns an error we want to forward."""
+
+    def __init__(self, code: str, message: str, http_status: int = 502):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.http_status = http_status
+
+
 def fetch_profile(username: str) -> dict[str, Any] | None:
-    """Return raw `data` object from twitterapi.io profile endpoint, or None."""
-    r = requests.get(
-        f"{API_BASE}/twitter/user/info",
-        params={"userName": username},
-        headers=_headers(),
-        timeout=HTTP_TIMEOUT,
-    )
+    """Return raw `data` object from twitterapi.io profile endpoint.
+
+    Returns None on a clean 404 ("user does not exist"). Raises UpstreamError
+    for other failures (out of credits, auth, server errors) so the caller can
+    surface a useful message instead of pretending the user doesn't exist.
+    """
+    r = _rate_limited_get(f"{API_BASE}/twitter/user/info", {"userName": username})
+    if r.status_code == 402:
+        raise UpstreamError(
+            "out_of_credits",
+            "twitterapi.io says the API account is out of credits. Top up at twitterapi.io.",
+            http_status=402,
+        )
+    if r.status_code in (401, 403):
+        raise UpstreamError(
+            "upstream_auth",
+            "twitterapi.io rejected the API key. Check TWITTERAPI_IO_KEY on the server.",
+            http_status=502,
+        )
+    if r.status_code == 429:
+        raise UpstreamError(
+            "rate_limited",
+            "twitterapi.io rate limit hit. Try again in a few seconds.",
+            http_status=429,
+        )
     if r.status_code != 200:
         log.warning("profile %s: HTTP %s %s", username, r.status_code, r.text[:200])
-        return None
+        raise UpstreamError(
+            "upstream_error",
+            f"twitterapi.io returned HTTP {r.status_code}.",
+            http_status=502,
+        )
     payload = r.json()
     if payload.get("status") != "success":
         log.warning("profile %s: %s", username, payload.get("msg"))
@@ -98,44 +152,60 @@ def fetch_profile(username: str) -> dict[str, Any] | None:
     return payload.get("data") or None
 
 
-def fetch_tweets(user_id: str, username: str, max_tweets: int) -> list[dict[str, Any]]:
-    """Page through last_tweets including replies, capped at max_tweets."""
+def fetch_tweets(
+    user_id: str,
+    username: str,
+    max_tweets: int,
+    window_days: int,
+) -> list[dict[str, Any]]:
+    """Page through last_tweets including replies.
+
+    Stops at `max_tweets` OR once the oldest tweet on a page is older than
+    `window_days + 2` (giving a small buffer past the analysis window so we
+    don't lose marginal tweets).
+    """
     out: list[dict[str, Any]] = []
     cursor = ""
     pages = 0
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=window_days + 2)
     while True:
-        r = requests.get(
+        r = _rate_limited_get(
             f"{API_BASE}/twitter/user/last_tweets",
-            params={
+            {
                 "userId": user_id,
                 "userName": username,
                 "cursor": cursor,
                 "includeReplies": "true",
             },
-            headers=_headers(),
-            timeout=HTTP_TIMEOUT,
         )
         if r.status_code != 200:
             log.warning("tweets %s: HTTP %s %s", username, r.status_code, r.text[:200])
             break
         payload = r.json()
         if payload.get("status") != "success":
-            log.warning("tweets %s: %s", username, payload.get("message"))
+            log.warning("tweets %s: %s", username, payload.get("msg") or payload.get("message"))
             break
-        batch = payload.get("tweets") or []
+        # `tweets` lives under `data` in the real response; the spec puts it
+        # at the top level, so we accept both for safety.
+        data = payload.get("data") or {}
+        batch = data.get("tweets") or payload.get("tweets") or []
         out.extend(batch)
         pages += 1
         if len(out) >= max_tweets:
             out = out[:max_tweets]
             break
+        # Stop once the oldest tweet on this page is past the window.
+        if batch:
+            oldest = _parse_twitter_date(batch[-1].get("createdAt", ""))
+            if oldest is not None and oldest < cutoff:
+                break
         if not payload.get("has_next_page"):
             break
         cursor = payload.get("next_cursor") or ""
         if not cursor:
             break
-        # safety: don't loop forever
-        if pages >= 60:
-            break
+        if pages >= 30:
+            break  # hard safety: never loop forever
     return out
 
 
@@ -283,7 +353,10 @@ def analyze(username: str) -> Any:
     if not API_KEY:
         return jsonify({"error": "missing_key", "message": "TWITTERAPI_IO_KEY not configured on the server."}), 500
 
-    profile_raw = fetch_profile(username)
+    try:
+        profile_raw = fetch_profile(username)
+    except UpstreamError as exc:
+        return jsonify({"error": exc.code, "message": exc.message}), exc.http_status
     if not profile_raw:
         return jsonify({"error": "not_found", "message": f"User @{username} not found, suspended, or private."}), 404
 
@@ -295,7 +368,7 @@ def analyze(username: str) -> Any:
         }), 200
 
     user_id = profile_raw.get("id") or ""
-    tweets = fetch_tweets(user_id, username, MAX_TWEETS)
+    tweets = fetch_tweets(user_id, username, MAX_TWEETS, WINDOW_DAYS)
     stats = compute_stats(tweets, WINDOW_DAYS)
 
     elapsed = round(time.time() - started, 2)
