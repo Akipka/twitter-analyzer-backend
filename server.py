@@ -17,8 +17,10 @@ On Render:    gunicorn server:app
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -47,6 +49,11 @@ HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "20"))
 # twitterapi.io free tier enforces 1 request every 5s. Override on paid plans.
 MIN_REQUEST_INTERVAL = float(os.environ.get("MIN_REQUEST_INTERVAL", "5.2"))
 
+# When DEMO_FALLBACK=true, return deterministic synthetic data if the upstream
+# API is out of credits or unauthorized. Useful for previewing the UI without
+# spending money.
+DEMO_FALLBACK = os.environ.get("DEMO_FALLBACK", "false").lower() in ("1", "true", "yes")
+
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*")
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
@@ -70,10 +77,34 @@ def _headers() -> dict[str, str]:
 
 _last_request_at: float = 0.0
 
+# When the upstream rejects us for billing/auth reasons, remember that for a
+# while so we don't waste the 5s rate-limit delay (and a network round trip)
+# on every subsequent request. Cleared after UPSTREAM_FAIL_TTL seconds.
+UPSTREAM_FAIL_TTL = 60.0
+_upstream_block_until: float = 0.0
+_upstream_block_code: str = ""
+
 
 def _rate_limited_get(url: str, params: dict[str, Any]) -> requests.Response:
-    """GET that respects MIN_REQUEST_INTERVAL and retries once on HTTP 429."""
-    global _last_request_at
+    """GET that respects MIN_REQUEST_INTERVAL and retries once on HTTP 429.
+
+    If we recently saw an out-of-credits / auth error, short-circuit by raising
+    the cached error instead of paying for the rate-limit wait.
+    """
+    global _last_request_at, _upstream_block_until, _upstream_block_code
+    if _upstream_block_until > time.time() and _upstream_block_code:
+        if _upstream_block_code == "out_of_credits":
+            raise UpstreamError(
+                "out_of_credits",
+                "twitterapi.io says the API account is out of credits. Top up at twitterapi.io.",
+                http_status=402,
+            )
+        if _upstream_block_code == "upstream_auth":
+            raise UpstreamError(
+                "upstream_auth",
+                "twitterapi.io rejected the API key. Check TWITTERAPI_IO_KEY on the server.",
+                http_status=502,
+            )
     wait = MIN_REQUEST_INTERVAL - (time.time() - _last_request_at)
     if wait > 0:
         time.sleep(wait)
@@ -84,6 +115,12 @@ def _rate_limited_get(url: str, params: dict[str, Any]) -> requests.Response:
         time.sleep(MIN_REQUEST_INTERVAL + 1.0)
         r = requests.get(url, params=params, headers=_headers(), timeout=HTTP_TIMEOUT)
         _last_request_at = time.time()
+    if r.status_code == 402:
+        _upstream_block_until = time.time() + UPSTREAM_FAIL_TTL
+        _upstream_block_code = "out_of_credits"
+    elif r.status_code in (401, 403):
+        _upstream_block_until = time.time() + UPSTREAM_FAIL_TTL
+        _upstream_block_code = "upstream_auth"
     return r
 
 
@@ -336,12 +373,85 @@ def shape_profile(p: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ── Demo data (used when upstream is out of credits) ───────────────────────
+
+
+def _demo_avatar_url(username: str) -> str:
+    # unavatar.io fetches the public Twitter/X avatar by handle (no auth needed)
+    # and falls back to a generic placeholder if the user doesn't exist.
+    return f"https://unavatar.io/twitter/{username}?fallback=https%3A%2F%2Fabs.twimg.com%2Fsticky%2Fdefault_profile_images%2Fdefault_profile_400x400.png"
+
+
+def _seeded_rng(username: str) -> random.Random:
+    seed = int(hashlib.sha256(username.lower().encode("utf-8")).hexdigest()[:12], 16)
+    return random.Random(seed)
+
+
+def demo_response(username: str, window_days: int) -> dict[str, Any]:
+    """Build a deterministic fake profile + stats so the UI can be evaluated
+    without burning twitterapi.io credits. Different usernames yield
+    different (but stable) report cards.
+    """
+    rng = _seeded_rng(username)
+    followers = rng.choice([42, 230, 1_400, 8_900, 41_000, 220_000, 1_300_000])
+    statuses = rng.randint(120, 50_000)
+    posts = rng.randint(0, 220)
+    replies = rng.randint(0, 350)
+    avg_likes = round(rng.uniform(0.5, max(2.0, followers / 4000)), 2)
+    avg_rt = round(avg_likes * rng.uniform(0.05, 0.18), 2)
+    avg_views = round(avg_likes * rng.uniform(40, 220), 0)
+    avg_quotes = round(avg_likes * rng.uniform(0.01, 0.05), 2)
+    avg_replies = round(avg_likes * rng.uniform(0.05, 0.4), 2)
+    avg_words = round(rng.uniform(6.0, 38.0), 1)
+    unique_ratio = round(rng.uniform(0.32, 0.82), 3)
+    total = posts + replies
+    activity_per_day = round(total / float(window_days or 30), 2)
+    engagement = round(avg_likes + 2 * avg_rt + 3 * avg_quotes + 0.5 * avg_replies, 2)
+    profile = {
+        "id": str(abs(hash(username)) % 10**18),
+        "userName": username,
+        "displayName": username.replace("_", " ").title() + " (demo)",
+        "avatarUrl": _demo_avatar_url(username),
+        "coverUrl": "",
+        "description": "Synthetic profile — demo mode.",
+        "location": "",
+        "followers": followers,
+        "following": rng.randint(50, 2000),
+        "statusesCount": statuses,
+        "isBlueVerified": rng.random() < 0.25,
+        "createdAt": "2018-01-01T00:00:00.000000Z",
+        "url": f"https://x.com/{username}",
+    }
+    stats = {
+        "window_days": window_days,
+        "in_window": True,
+        "tweets_analyzed": total,
+        "posts": posts,
+        "replies": replies,
+        "total": total,
+        "avg_likes": avg_likes,
+        "avg_retweets": avg_rt,
+        "avg_views": avg_views,
+        "avg_quotes": avg_quotes,
+        "avg_replies_received": avg_replies,
+        "engagement_score": engagement,
+        "avg_chars": round(avg_words * 6.2, 1),
+        "avg_words": avg_words,
+        "unique_word_ratio": unique_ratio,
+        "activity_per_day": activity_per_day,
+        "days_span": float(window_days),
+        "earliest": None,
+        "latest": None,
+    }
+    return {"profile": profile, "stats": stats, "elapsed": 0.0, "demo": True}
+
+
 # ── Routes ──────────────────────────────────────────────────────────────────
 
 
 @app.get("/health")
 def health() -> Any:
-    return jsonify({"ok": True, "has_key": bool(API_KEY)})
+    return jsonify({"ok": True, "has_key": bool(API_KEY), "demo_fallback": DEMO_FALLBACK})
 
 
 @app.get("/api/analyze/<username>")
@@ -356,6 +466,9 @@ def analyze(username: str) -> Any:
     try:
         profile_raw = fetch_profile(username)
     except UpstreamError as exc:
+        if DEMO_FALLBACK and exc.code in ("out_of_credits", "upstream_auth"):
+            log.info("demo fallback for %s (reason: %s)", username, exc.code)
+            return jsonify(demo_response(username, WINDOW_DAYS))
         return jsonify({"error": exc.code, "message": exc.message}), exc.http_status
     if not profile_raw:
         return jsonify({"error": "not_found", "message": f"User @{username} not found, suspended, or private."}), 404
