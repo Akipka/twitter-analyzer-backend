@@ -1,13 +1,19 @@
 services:
   - type: web
-    name: gradebook-api
+    name: twitter-report-card-api
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn server:app --chdir . --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --timeout 60
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
-        value: "3.11.6"
-      - key: CORS_ORIGINS
-        # Replace YOUR_VERCEL_URL with your actual Vercel URL after frontend deploy
+        value: "3.11.9"
+      - key: TWITTERAPI_IO_KEY
         sync: false
-    healthCheckPath: /health
+      - key: CORS_ORIGINS
+        sync: false
+      - key: WINDOW_DAYS
+        value: "30"
+      - key: MAX_TWEETS
+        value: "500"
