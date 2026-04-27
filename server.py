@@ -54,6 +54,12 @@ MIN_REQUEST_INTERVAL = float(os.environ.get("MIN_REQUEST_INTERVAL", "5.2"))
 # spending money.
 DEMO_FALLBACK = os.environ.get("DEMO_FALLBACK", "false").lower() in ("1", "true", "yes")
 
+# In-process cache for /api/analyze responses. The same username is served
+# from the cache for ANALYZE_CACHE_TTL seconds (default 24h). Drastically
+# reduces twitterapi.io spend for popular profiles. Pass ?nocache=1 to bypass.
+ANALYZE_CACHE_TTL = int(os.environ.get("ANALYZE_CACHE_TTL", str(60 * 60 * 24)))
+ANALYZE_CACHE_MAX = int(os.environ.get("ANALYZE_CACHE_MAX", "5000"))
+
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*")
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
@@ -451,7 +457,40 @@ def demo_response(username: str, window_days: int) -> dict[str, Any]:
 
 @app.get("/health")
 def health() -> Any:
-    return jsonify({"ok": True, "has_key": bool(API_KEY), "demo_fallback": DEMO_FALLBACK})
+    return jsonify({
+        "ok": True,
+        "has_key": bool(API_KEY),
+        "demo_fallback": DEMO_FALLBACK,
+        "cache_size": len(_ANALYZE_CACHE),
+        "cache_ttl_seconds": ANALYZE_CACHE_TTL,
+    })
+
+
+# Per-username analyze cache. Maps lower(username) → (cached_at, payload).
+# Only successful real (non-demo) responses are cached.
+_ANALYZE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _cache_get(username: str) -> dict[str, Any] | None:
+    entry = _ANALYZE_CACHE.get(username.lower())
+    if not entry:
+        return None
+    cached_at, payload = entry
+    if time.time() - cached_at > ANALYZE_CACHE_TTL:
+        _ANALYZE_CACHE.pop(username.lower(), None)
+        return None
+    age = int(time.time() - cached_at)
+    out = dict(payload)
+    out["cached"] = True
+    out["cached_age_seconds"] = age
+    return out
+
+
+def _cache_put(username: str, payload: dict[str, Any]) -> None:
+    if len(_ANALYZE_CACHE) >= ANALYZE_CACHE_MAX:
+        oldest = min(_ANALYZE_CACHE.items(), key=lambda kv: kv[1][0])[0]
+        _ANALYZE_CACHE.pop(oldest, None)
+    _ANALYZE_CACHE[username.lower()] = (time.time(), payload)
 
 
 # Tiny in-process LRU cache for avatar bytes. Avatars rarely change, and the
@@ -523,6 +562,8 @@ def avatar(username: str) -> Any:
 
 @app.get("/api/analyze/<username>")
 def analyze(username: str) -> Any:
+    from flask import request
+
     started = time.time()
     username = username.strip().lstrip("@")
     if not USERNAME_RE.match(username):
@@ -530,11 +571,19 @@ def analyze(username: str) -> Any:
     if not API_KEY:
         return jsonify({"error": "missing_key", "message": "TWITTERAPI_IO_KEY not configured on the server."}), 500
 
+    nocache = request.args.get("nocache", "").lower() in ("1", "true", "yes")
+    if not nocache:
+        cached = _cache_get(username)
+        if cached is not None:
+            log.info("cache hit %s (age=%ss)", username, cached.get("cached_age_seconds"))
+            return jsonify(cached)
+
     try:
         profile_raw = fetch_profile(username)
     except UpstreamError as exc:
         if DEMO_FALLBACK and exc.code in ("out_of_credits", "upstream_auth"):
             log.info("demo fallback for %s (reason: %s)", username, exc.code)
+            # Demo responses are NOT cached — they're synthetic and free anyway.
             return jsonify(demo_response(username, WINDOW_DAYS))
         return jsonify({"error": exc.code, "message": exc.message}), exc.http_status
     if not profile_raw:
@@ -554,11 +603,13 @@ def analyze(username: str) -> Any:
     elapsed = round(time.time() - started, 2)
     log.info("analyze %s: %d tweets, %.2fs", username, len(tweets), elapsed)
 
-    return jsonify({
+    payload = {
         "profile": shape_profile(profile_raw),
         "stats": stats,
         "elapsed": elapsed,
-    })
+    }
+    _cache_put(username, payload)
+    return jsonify(payload)
 
 
 # ── Entrypoint ──────────────────────────────────────────────────────────────
