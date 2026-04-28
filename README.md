@@ -9,7 +9,8 @@ frontend to render the "report card".
 | Method | Path                       | Description                                  |
 | ------ | -------------------------- | -------------------------------------------- |
 | GET    | `/health`                  | Liveness check + reports whether key is set. |
-| GET    | `/api/analyze/<username>`  | Profile + stats for the last `WINDOW_DAYS`.  |
+| GET    | `/api/analyze/<username>`  | Profile + stats for the last `MAX_TWEETS`.   |
+| GET    | `/api/classmates/<class>`  | Roster of classmates for a Crypto School class. |
 
 ## Environment variables
 
@@ -17,8 +18,7 @@ frontend to render the "report card".
 | --------------------- | -------- | ------- | ------------------------------------------ |
 | `TWITTERAPI_IO_KEY`   | yes      | —       | Get one at <https://twitterapi.io>.        |
 | `CORS_ORIGINS`        | no       | `*`     | Comma-separated list of allowed origins.   |
-| `WINDOW_DAYS`         | no       | `30`    | Time window for stats.                     |
-| `MAX_TWEETS`          | no       | `500`   | Hard cap to control cost per analysis.     |
+| `MAX_TWEETS`          | no       | `30`    | Tweets pulled per analysis (count-based window). |
 | `HTTP_TIMEOUT`        | no       | `20`    | Per-request timeout to twitterapi.io.      |
 | `PORT`                | no       | `5000`  | Set automatically by Render.               |
 
@@ -41,4 +41,6 @@ in the dashboard.
 ## Cost
 
 twitterapi.io charges $0.15 per 1,000 tweets and $0.18 per 1,000 profiles.
-With `MAX_TWEETS=500` a single analysis costs at most ≈ $0.075.
+With `MAX_TWEETS=30` a single analysis costs at most ≈ $0.0063 (one profile
+lookup plus ≤ 2 page fetches), and the in-memory 24h cache serves repeat
+lookups for $0.
