@@ -30,6 +30,9 @@ import requests
 from flask import Flask, jsonify
 from flask_cors import CORS
 
+import classify
+import classmates
+
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -449,7 +452,56 @@ def demo_response(username: str, window_days: int) -> dict[str, Any]:
         "earliest": None,
         "latest": None,
     }
-    return {"profile": profile, "stats": stats, "elapsed": 0.0, "demo": True}
+    # Pick a deterministic class based on the username hash, so the demo UI
+    # has something interesting to show for the classroom feature without
+    # actually running the keyword classifier on real text.
+    class_ids = list(classify.CLASSES.keys())
+    primary = rng.choice(class_ids + ["general"])  # 1/(N+1) chance of "general"
+    if primary == "general":
+        primary_label = "General Studies"
+        primary_emoji = "🎓"
+        primary_blurb = "Posts a bit of everything — no clear specialty yet."
+    else:
+        spec = classify.CLASSES[primary]
+        primary_label = spec["label"]
+        primary_emoji = spec["emoji"]
+        primary_blurb = spec["blurb"]
+
+    # Synthesise a plausible breakdown: primary gets a chunky share, the rest
+    # split a long tail. Always sums to 1.0.
+    raw_shares = {cid: rng.uniform(0.05, 0.20) for cid in class_ids}
+    if primary != "general":
+        raw_shares[primary] = rng.uniform(0.40, 0.65)
+    s = sum(raw_shares.values())
+    breakdown = sorted(
+        ({
+            "id": cid,
+            "label": classify.CLASSES[cid]["label"],
+            "emoji": classify.CLASSES[cid]["emoji"],
+            "share": round(raw_shares[cid] / s, 3),
+            "hits": int(raw_shares[cid] / s * total) if total else 0,
+        } for cid in class_ids),
+        key=lambda x: -x["share"],
+    )
+    classification = {
+        "primary": primary,
+        "label": primary_label,
+        "emoji": primary_emoji,
+        "blurb": primary_blurb,
+        "confidence": round(raw_shares.get(primary, 0.0) / s, 3) if primary != "general" else 0.0,
+        "breakdown": breakdown,
+        "tweets_classified": int(total * 0.6),
+        "tweets_total": total,
+    }
+    classmates.add_member(primary, username, profile["displayName"])
+
+    return {
+        "profile": profile,
+        "stats": stats,
+        "classification": classification,
+        "elapsed": 0.0,
+        "demo": True,
+    }
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
@@ -560,6 +612,40 @@ def avatar(username: str) -> Any:
     )
 
 
+@app.get("/api/classmates/<class_id>")
+def classmates_route(class_id: str) -> Any:
+    """Return the roster for a class.
+
+    Includes the seed celebrities plus any users who have actually been
+    classified into this class on this server instance. The frontend uses
+    /api/avatar/<username> to load each member's avatar — no avatar data
+    is shipped here.
+    """
+    cid = class_id.strip().lower()
+    valid_classes = set(classify.all_class_ids())
+    if cid not in valid_classes:
+        return jsonify({
+            "error": "unknown_class",
+            "message": f"Unknown class '{class_id}'. Valid: {sorted(valid_classes)}",
+        }), 404
+
+    if cid == "general":
+        label = "General Studies"
+        emoji = "🎓"
+    else:
+        spec = classify.CLASSES[cid]
+        label = spec["label"]
+        emoji = spec["emoji"]
+
+    return jsonify({
+        "class": cid,
+        "label": label,
+        "emoji": emoji,
+        "members": classmates.get_roster(cid),
+        "size_cap": classmates.CLASS_SIZE,
+    })
+
+
 @app.get("/api/analyze/<username>")
 def analyze(username: str) -> Any:
     from flask import request
@@ -600,12 +686,30 @@ def analyze(username: str) -> Any:
     tweets = fetch_tweets(user_id, username, MAX_TWEETS, WINDOW_DAYS)
     stats = compute_stats(tweets, WINDOW_DAYS)
 
+    # Classify the user into a Crypto Twitter class based on tweet text.
+    # Pure keyword counting — no external calls, deterministic, free.
+    classification = classify.classify_user(
+        (t.get("text") or "") for t in tweets
+    )
+
+    profile_shaped = shape_profile(profile_raw)
+    classmates.add_member(
+        classification["primary"],
+        profile_shaped["userName"] or username,
+        profile_shaped["displayName"] or username,
+    )
+
     elapsed = round(time.time() - started, 2)
-    log.info("analyze %s: %d tweets, %.2fs", username, len(tweets), elapsed)
+    log.info(
+        "analyze %s: %d tweets, class=%s (%.0f%%), %.2fs",
+        username, len(tweets), classification["primary"],
+        100 * classification["confidence"], elapsed,
+    )
 
     payload = {
-        "profile": shape_profile(profile_raw),
+        "profile": profile_shaped,
         "stats": stats,
+        "classification": classification,
         "elapsed": elapsed,
     }
     _cache_put(username, payload)
