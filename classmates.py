@@ -19,9 +19,14 @@ entries here don't show up as ghost smileys in the grid.
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import threading
 import time
-from typing import Iterable
+from typing import Callable, Iterable
+
+log = logging.getLogger(__name__)
 
 
 # A traditional US public-school class is ~25 students. We cap each
@@ -282,13 +287,107 @@ def add_member(class_id: str, username: str, display_name: str) -> None:
 
 def get_roster(class_id: str) -> list[dict]:
     """Snapshot of the roster for `class_id`. Sorted: real users first
-    (most-recent additions on top), seeded "celebrity" entries below."""
+    (most-recent additions on top), seeded "celebrity" entries below.
+
+    Filters out seeded entries that have been validated as dead via
+    `mark_seed_dead`. Real (user-added) entries are always kept; the
+    user analysed real, so by definition they exist on Twitter."""
     with _LOCK:
         roster = list(_ROSTERS.get(class_id, []))
     real = [r for r in roster if not r["seeded"]]
-    seed = [r for r in roster if r["seeded"]]
+    seed = [
+        r for r in roster
+        if r["seeded"] and not _is_seed_dead(r["username"])
+    ]
     real.sort(key=lambda r: -r.get("addedAt", 0.0))
     return real + seed
+
+
+# ── Seed validation ────────────────────────────────────────────────────────
+
+# We persist the dead-seeds list on disk so a Render redeploy doesn't have to
+# re-validate from scratch. /tmp survives a single dyno's lifetime, which is
+# plenty given seed validation runs at most once per dyno in practice.
+_SEED_STATUS_PATH = os.environ.get(
+    "SEED_STATUS_PATH",
+    "/tmp/seed_status.json",
+)
+_SEED_STATUS_LOCK = threading.Lock()
+# username (lowercase) -> True if confirmed dead/suspended/404.
+_SEED_DEAD: dict[str, bool] = {}
+# class_id -> True once that class's seeds have been validated this process.
+_SEEDS_VALIDATED: dict[str, bool] = {}
+
+
+def _load_seed_status() -> None:
+    """Best-effort load of cached dead-seeds from disk."""
+    global _SEED_DEAD
+    try:
+        with open(_SEED_STATUS_PATH, "r", encoding="utf-8") as fp:
+            data = json.load(fp) or {}
+        if isinstance(data, dict):
+            _SEED_DEAD = {
+                k.lower(): bool(v) for k, v in data.items() if isinstance(k, str)
+            }
+            log.info("seed_status: loaded %d entries from %s", len(_SEED_DEAD), _SEED_STATUS_PATH)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log.warning("seed_status: failed to load %s: %s", _SEED_STATUS_PATH, exc)
+
+
+def _save_seed_status() -> None:
+    """Best-effort save of dead-seeds list to disk. Silently ignores errors."""
+    try:
+        with open(_SEED_STATUS_PATH, "w", encoding="utf-8") as fp:
+            json.dump(_SEED_DEAD, fp)
+    except Exception as exc:
+        log.warning("seed_status: failed to save %s: %s", _SEED_STATUS_PATH, exc)
+
+
+_load_seed_status()
+
+
+def _is_seed_dead(username: str) -> bool:
+    return _SEED_DEAD.get(username.lower(), False)
+
+
+def mark_seed_dead(username: str) -> None:
+    """Mark a seed handle as confirmed dead. Persists to disk."""
+    with _SEED_STATUS_LOCK:
+        _SEED_DEAD[username.lower()] = True
+        _save_seed_status()
+
+
+def validate_class_seeds(
+    class_id: str,
+    profile_fetcher: Callable[[str], dict | None],
+) -> None:
+    """Validate every seed handle in `class_id`'s roster against
+    `profile_fetcher` (typically server.fetch_profile). Marks each handle
+    that returns None / raises as dead, and persists the result.
+
+    Idempotent within a single process — does nothing on subsequent calls
+    for the same class. Designed to be called inline from the analyze
+    handler the first time a roster for a given class is requested.
+    """
+    with _SEED_STATUS_LOCK:
+        if _SEEDS_VALIDATED.get(class_id):
+            return
+        _SEEDS_VALIDATED[class_id] = True
+    seeds = SEEDS.get(class_id, [])
+    for s in seeds:
+        username = s["username"]
+        if _is_seed_dead(username):
+            continue
+        try:
+            profile = profile_fetcher(username)
+        except Exception as exc:
+            log.info("seed_validate: %s lookup raised %s; skipping", username, exc)
+            continue
+        if profile is None:
+            log.info("seed_validate: %s is dead, marking", username)
+            mark_seed_dead(username)
 
 
 def all_class_ids() -> Iterable[str]:
