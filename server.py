@@ -228,20 +228,34 @@ def fetch_tweets(
             log.warning("tweets %s: HTTP %s %s", username, r.status_code, r.text[:200])
             break
         payload = r.json()
-        if payload.get("status") != "success":
+        # The /twitter/user/last_tweets endpoint returns {tweets, has_next_page,
+        # next_cursor} directly (no `status: success` wrapper), unlike
+        # /twitter/user/info. We only treat the response as an error if a
+        # status field is explicitly present AND set to something other than
+        # success — otherwise we just take whatever tweets came back.
+        status = payload.get("status")
+        if status and status != "success":
             log.warning("tweets %s: %s", username, payload.get("msg") or payload.get("message"))
             break
-        # `tweets` lives under `data` in the real response; the spec puts it
-        # at the top level, so we accept both for safety.
+        # `tweets` may live at the top level (per the OpenAPI spec) or under
+        # `data` (older response shape); accept both.
         data = payload.get("data") or {}
         batch = data.get("tweets") or payload.get("tweets") or []
+        if not batch:
+            # Empty page → nothing more to fetch.
+            log.info("tweets %s: empty page (page=%s, keys=%s)", username, pages, list(payload.keys()))
+            break
         out.extend(batch)
         pages += 1
         if len(out) >= max_tweets:
             break
-        if not payload.get("has_next_page"):
+        # has_next_page may live at top level or under `data`.
+        has_next = payload.get("has_next_page")
+        if has_next is None:
+            has_next = data.get("has_next_page")
+        if not has_next:
             break
-        cursor = payload.get("next_cursor") or ""
+        cursor = payload.get("next_cursor") or data.get("next_cursor") or ""
         if not cursor:
             break
     return out[:max_tweets]
