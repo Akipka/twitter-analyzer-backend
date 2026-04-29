@@ -32,6 +32,7 @@ from flask_cors import CORS
 
 import classify
 import classmates
+import threading
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -629,6 +630,23 @@ def avatar(username: str) -> Any:
     )
 
 
+def _kick_seed_validation(class_id: str) -> None:
+    """Spawn a daemon thread that validates the class's seed handles in the
+    background. The frontend never has to wait for this — the very first
+    request for a class may show a stale roster, subsequent ones get the
+    cleaned one once validation finishes."""
+    if not class_id:
+        return
+
+    def _runner() -> None:
+        try:
+            classmates.validate_class_seeds(class_id, fetch_profile)
+        except Exception as exc:
+            log.warning("seed_validate %s raised %s", class_id, exc)
+
+    threading.Thread(target=_runner, daemon=True, name=f"seed-validate-{class_id}").start()
+
+
 @app.get("/api/classmates/<class_id>")
 def classmates_route(class_id: str) -> Any:
     """Return the roster for a class.
@@ -654,6 +672,7 @@ def classmates_route(class_id: str) -> Any:
         label = spec["label"]
         emoji = spec["emoji"]
 
+    _kick_seed_validation(cid)
     return jsonify({
         "class": cid,
         "label": label,
@@ -715,6 +734,7 @@ def analyze(username: str) -> Any:
         profile_shaped["userName"] or username,
         profile_shaped["displayName"] or username,
     )
+    _kick_seed_validation(classification["primary"])
 
     elapsed = round(time.time() - started, 2)
     log.info(
