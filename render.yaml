@@ -13,7 +13,5 @@ services:
         sync: false
       - key: CORS_ORIGINS
         sync: false
-      - key: WINDOW_DAYS
-        value: "30"
       - key: MAX_TWEETS
-        value: "500"
+        value: "30"

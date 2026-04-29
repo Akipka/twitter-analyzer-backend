@@ -23,7 +23,7 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -39,18 +39,18 @@ import classmates
 API_KEY = os.environ.get("TWITTERAPI_IO_KEY", "").strip()
 API_BASE = "https://api.twitterapi.io"
 
-# Hard cap on tweets per analysis. Each page returns 20.
-# Default 200 fits the free-tier 5s/req cooldown inside Render's 60s timeout.
-MAX_TWEETS = int(os.environ.get("MAX_TWEETS", "200"))
-
-# Window for stats (days). Older tweets stop pagination once we've covered it.
-WINDOW_DAYS = int(os.environ.get("WINDOW_DAYS", "30"))
+# Hard cap on tweets per analysis. twitterapi.io returns ~20 tweets per page.
+# We grab the most recent MAX_TWEETS regardless of date — a count-based window.
+# 30 is the default because it's one classroom-sized sample that keeps every
+# analysis request well inside Render's 30s gunicorn timeout (1–3s on paid tier).
+MAX_TWEETS = int(os.environ.get("MAX_TWEETS", "30"))
 
 # Per-request HTTP timeout to twitterapi.io.
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "20"))
 
-# twitterapi.io free tier enforces 1 request every 5s. Override on paid plans.
-MIN_REQUEST_INTERVAL = float(os.environ.get("MIN_REQUEST_INTERVAL", "5.2"))
+# Paid twitterapi.io plans don't have a cooldown. Free tier enforced 1/5s.
+# We send at most 2 page requests per analyze, so even on free this stays quick.
+MIN_REQUEST_INTERVAL = float(os.environ.get("MIN_REQUEST_INTERVAL", "0.1"))
 
 # When DEMO_FALLBACK=true, return deterministic synthetic data if the upstream
 # API is out of credits or unauthorized. Useful for previewing the UI without
@@ -202,19 +202,19 @@ def fetch_tweets(
     user_id: str,
     username: str,
     max_tweets: int,
-    window_days: int,
 ) -> list[dict[str, Any]]:
-    """Page through last_tweets including replies.
+    """Pull the most recent ``max_tweets`` tweets (including replies).
 
-    Stops at `max_tweets` OR once the oldest tweet on a page is older than
-    `window_days + 2` (giving a small buffer past the analysis window so we
-    don't lose marginal tweets).
+    twitterapi.io returns ~20 tweets per page, so we fetch 1–2 pages max and
+    stop as soon as we have enough. No date filtering — a user who posts once
+    a month contributes their last 30 tweets over ~2.5 years, a firehose user
+    over a single day. Downstream grading normalises by the observed span.
     """
     out: list[dict[str, Any]] = []
     cursor = ""
     pages = 0
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=window_days + 2)
-    while True:
+    # Safety: at most 3 page fetches even if the API is being stingy.
+    while len(out) < max_tweets and pages < 3:
         r = _rate_limited_get(
             f"{API_BASE}/twitter/user/last_tweets",
             {
@@ -238,21 +238,13 @@ def fetch_tweets(
         out.extend(batch)
         pages += 1
         if len(out) >= max_tweets:
-            out = out[:max_tweets]
             break
-        # Stop once the oldest tweet on this page is past the window.
-        if batch:
-            oldest = _parse_twitter_date(batch[-1].get("createdAt", ""))
-            if oldest is not None and oldest < cutoff:
-                break
         if not payload.get("has_next_page"):
             break
         cursor = payload.get("next_cursor") or ""
         if not cursor:
             break
-        if pages >= 30:
-            break  # hard safety: never loop forever
-    return out
+    return out[:max_tweets]
 
 
 # ── Stats computation ───────────────────────────────────────────────────────
@@ -261,23 +253,15 @@ def fetch_tweets(
 WORD_RE = re.compile(r"[a-zа-яё0-9]+", re.IGNORECASE)
 
 
-def compute_stats(tweets: list[dict[str, Any]], window_days: int) -> dict[str, Any]:
+def compute_stats(tweets: list[dict[str, Any]]) -> dict[str, Any]:
     """Compute activity stats for the report card.
 
-    Window = last `window_days` days. Older tweets are excluded from per-window
-    counters but still affect overall ratios when window is empty.
+    The sample is ``tweets`` as returned by ``fetch_tweets`` — i.e. the user's
+    most recent ~30 tweets. Time window is implicit: we report ``days_span``
+    (elapsed time between the oldest and newest tweet in the sample) so the
+    frontend can normalise rates without any hardcoded window.
     """
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=window_days)
-
-    in_window: list[dict[str, Any]] = []
-    for t in tweets:
-        dt = _parse_twitter_date(t.get("createdAt", ""))
-        if dt is not None and dt >= cutoff:
-            in_window.append(t)
-
-    # If there's literally nothing in window, still let frontend render the
-    # "expelled" verdict — but we report counts anyway.
-    sample = in_window if in_window else tweets
+    sample = tweets
     posts = 0
     replies = 0
     likes = 0
@@ -332,18 +316,22 @@ def compute_stats(tweets: list[dict[str, Any]], window_days: int) -> dict[str, A
     # Engagement = likes + 2*RT + 3*quote + 0.5*replies_received per tweet.
     engagement = avg_likes + 2 * avg_rt + 3 * avg_quotes + 0.5 * avg_replies_received
 
-    # Days span actually observed (min(window, observed range)).
+    # Days span actually observed. Floor at 1.0 to avoid div-by-zero-ish
+    # spikes (30 tweets posted in 10 minutes shouldn't read as 4320/day).
     if earliest and latest:
         days_span = max((latest - earliest).total_seconds() / 86400.0, 1.0)
     else:
-        days_span = float(window_days)
-    days_span = min(days_span, float(window_days))
+        days_span = 1.0
 
     activity_per_day = total / days_span if days_span > 0 else 0.0
+    posts_per_day = posts / days_span if days_span > 0 else 0.0
+    replies_per_day = replies / days_span if days_span > 0 else 0.0
 
     return {
-        "window_days": window_days,
-        "in_window": bool(in_window),
+        # Kept for backward compatibility with older clients. Reflects the
+        # observed span rounded up — not a configured 30-day window.
+        "window_days": int(round(days_span)),
+        "in_window": True,
         "tweets_analyzed": len(sample),
         "posts": posts,
         "replies": replies,
@@ -358,6 +346,8 @@ def compute_stats(tweets: list[dict[str, Any]], window_days: int) -> dict[str, A
         "avg_words": round(avg_words, 1),
         "unique_word_ratio": round(unique_word_ratio, 3),
         "activity_per_day": round(activity_per_day, 2),
+        "posts_per_day": round(posts_per_day, 2),
+        "replies_per_day": round(replies_per_day, 2),
         "days_span": round(days_span, 1),
         "earliest": earliest.isoformat() if earliest else None,
         "latest": latest.isoformat() if latest else None,
@@ -396,16 +386,26 @@ def _seeded_rng(username: str) -> random.Random:
     return random.Random(seed)
 
 
-def demo_response(username: str, window_days: int) -> dict[str, Any]:
+def demo_response(username: str) -> dict[str, Any]:
     """Build a deterministic fake profile + stats so the UI can be evaluated
     without burning twitterapi.io credits. Different usernames yield
     different (but stable) report cards.
+
+    Mirrors the real pipeline: we pretend to have pulled the user's last
+    ``MAX_TWEETS`` tweets and spread them over a random span (from an hour-long
+    firehose to a multi-month lurker).
     """
     rng = _seeded_rng(username)
     followers = rng.choice([42, 230, 1_400, 8_900, 41_000, 220_000, 1_300_000])
     statuses = rng.randint(120, 50_000)
-    posts = rng.randint(0, 220)
-    replies = rng.randint(0, 350)
+    # Total is pinned at MAX_TWEETS (the real flow is count-limited).
+    total = MAX_TWEETS
+    reply_share = rng.uniform(0.1, 0.75)
+    replies = int(round(total * reply_share))
+    posts = total - replies
+    # Span over which the 30 tweets were posted. Low end = frequent poster,
+    # high end = casual lurker whose last 30 tweets stretch back ~7 months.
+    days_span = round(rng.uniform(0.5, 220.0), 1)
     avg_likes = round(rng.uniform(0.5, max(2.0, followers / 4000)), 2)
     avg_rt = round(avg_likes * rng.uniform(0.05, 0.18), 2)
     avg_views = round(avg_likes * rng.uniform(40, 220), 0)
@@ -413,8 +413,9 @@ def demo_response(username: str, window_days: int) -> dict[str, Any]:
     avg_replies = round(avg_likes * rng.uniform(0.05, 0.4), 2)
     avg_words = round(rng.uniform(6.0, 38.0), 1)
     unique_ratio = round(rng.uniform(0.32, 0.82), 3)
-    total = posts + replies
-    activity_per_day = round(total / float(window_days or 30), 2)
+    activity_per_day = round(total / days_span, 2)
+    posts_per_day = round(posts / days_span, 2)
+    replies_per_day = round(replies / days_span, 2)
     engagement = round(avg_likes + 2 * avg_rt + 3 * avg_quotes + 0.5 * avg_replies, 2)
     profile = {
         "id": str(abs(hash(username)) % 10**18),
@@ -432,7 +433,7 @@ def demo_response(username: str, window_days: int) -> dict[str, Any]:
         "url": f"https://x.com/{username}",
     }
     stats = {
-        "window_days": window_days,
+        "window_days": int(round(days_span)),
         "in_window": True,
         "tweets_analyzed": total,
         "posts": posts,
@@ -448,7 +449,9 @@ def demo_response(username: str, window_days: int) -> dict[str, Any]:
         "avg_words": avg_words,
         "unique_word_ratio": unique_ratio,
         "activity_per_day": activity_per_day,
-        "days_span": float(window_days),
+        "posts_per_day": posts_per_day,
+        "replies_per_day": replies_per_day,
+        "days_span": days_span,
         "earliest": None,
         "latest": None,
     }
@@ -670,7 +673,7 @@ def analyze(username: str) -> Any:
         if DEMO_FALLBACK and exc.code in ("out_of_credits", "upstream_auth"):
             log.info("demo fallback for %s (reason: %s)", username, exc.code)
             # Demo responses are NOT cached — they're synthetic and free anyway.
-            return jsonify(demo_response(username, WINDOW_DAYS))
+            return jsonify(demo_response(username))
         return jsonify({"error": exc.code, "message": exc.message}), exc.http_status
     if not profile_raw:
         return jsonify({"error": "not_found", "message": f"User @{username} not found, suspended, or private."}), 404
@@ -683,8 +686,8 @@ def analyze(username: str) -> Any:
         }), 200
 
     user_id = profile_raw.get("id") or ""
-    tweets = fetch_tweets(user_id, username, MAX_TWEETS, WINDOW_DAYS)
-    stats = compute_stats(tweets, WINDOW_DAYS)
+    tweets = fetch_tweets(user_id, username, MAX_TWEETS)
+    stats = compute_stats(tweets)
 
     # Classify the user into a Crypto Twitter class based on tweet text.
     # Pure keyword counting — no external calls, deterministic, free.
