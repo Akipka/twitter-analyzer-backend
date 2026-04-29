@@ -24,7 +24,17 @@ import logging
 import os
 import threading
 import time
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
+
+
+def _coerce_int(value: Any) -> int:
+    """Best-effort int coercion for twitterapi.io stat fields, which can
+    arrive as strings or None depending on the upstream response. Anything
+    that fails to parse counts as zero so it trips the zombie filter."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 log = logging.getLogger(__name__)
 
@@ -415,11 +425,30 @@ def validate_class_seeds(
             log.info("seed_validate: %s is dead, marking", username)
             mark_seed_dead(username)
             continue
+        # Beyond plain 404, also drop seeds that twitterapi.io still returns
+        # but are clearly zombie / abandoned handles: default egg-avatar,
+        # zero followers, or zero posts. These show up as empty grey tiles
+        # in the classroom and erode trust in the roster.
+        avatar_url = profile.get("profilePicture") or profile.get("avatarUrl") or ""
+        followers = _coerce_int(profile.get("followers"))
+        statuses = _coerce_int(profile.get("statusesCount"))
+        is_default_avatar = (
+            not avatar_url
+            or "default_profile_images" in avatar_url.lower()
+        )
+        if is_default_avatar or followers < 50 or statuses < 5:
+            log.info(
+                "seed_validate: %s is zombie (avatar=%s followers=%d statuses=%d), marking",
+                username,
+                "default" if is_default_avatar else "ok",
+                followers,
+                statuses,
+            )
+            mark_seed_dead(username)
+            continue
         # Live seed: pick up the real avatar URL so the frontend can render
         # it directly without going through the unavatar proxy.
-        avatar_url = profile.get("profilePicture") or profile.get("avatarUrl") or ""
-        if avatar_url:
-            set_member_avatar(class_id, username, avatar_url)
+        set_member_avatar(class_id, username, avatar_url)
 
 
 def all_class_ids() -> Iterable[str]:
