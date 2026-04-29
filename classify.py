@@ -2,19 +2,21 @@
 Crypto-class classifier.
 
 Given the text of a user's recent tweets, decide which "class" of Crypto
-Twitter the user belongs to: DeFi / Perps / NFT / Trading / Shitposting /
-Prediction Markets / General. Pure keyword counting — zero external API
+Twitter the user belongs to. Pure keyword counting — zero external API
 calls, deterministic, free.
 
-The output drives:
-  • the `class` field on the analyze response (used to theme subject names
-    on the frontend, and to assign the user to a classroom of peers),
-  • the `class_breakdown` field (percent of tweets that hit each category,
-    rendered as a horizontal bar on the report card).
+Twelve classes are tracked plus a "general" fallback when no class
+crosses the recognition bar. The output drives:
+
+  • the `class` field on the analyze response (used to theme subject
+    names on the frontend, and to assign the user to a classroom of
+    peers),
+  • the `class_breakdown` field (percent of tweets that hit each
+    category, rendered as a horizontal bar on the report card).
 
 Tweaking thresholds:
-  • A tweet matches a class if any of that class's keywords appear in the
-    lower-cased tweet text. A tweet may match more than one class.
+  • A tweet matches a class if any of that class's keywords appear in
+    the lower-cased tweet text. A tweet may match more than one class.
   • The user's primary class is the one with the highest hit count, BUT
     only if it crossed `MIN_PRIMARY_HITS` (otherwise the user is
     "General" — they don't post enough crypto-specific content to be
@@ -32,14 +34,15 @@ from typing import Iterable
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 
 # Below the bar of "this user is identifiably crypto-Twitter", we leave
-# them in General. ~5 hits across the sampled tweets is a soft signal that
+# them in General. With a 30-tweet sample, ~4 hits is a soft signal that
 # they post about something specific.
-MIN_PRIMARY_HITS = 5
+MIN_PRIMARY_HITS = 4
 
 # Each class has:
 #   - a stable id (used as the dict key on the wire)
 #   - a human label
 #   - an emoji used as the class crest
+#   - a one-line blurb shown in the class assignment card
 #   - a set of single-word keywords (matched on word boundary)
 #   - a list of multi-word phrases (matched as case-folded substrings)
 CLASSES: dict[str, dict] = {
@@ -48,19 +51,18 @@ CLASSES: dict[str, dict] = {
         "emoji": "🏦",
         "blurb": "Yield, lending, governance, protocol design.",
         "words": {
-            "defi", "tvl", "apy", "apr", "yield", "yields", "farm", "farming",
-            "vault", "vaults", "lp", "amm", "lending", "borrow", "borrowing",
-            "collateral", "stablecoin", "stables", "rebase", "peg", "depeg",
-            "liquidity", "lps", "swap", "uniswap", "aave", "compound", "maker",
-            "dai", "usdc", "usdt", "frax", "curve", "balancer", "morpho",
-            "pendle", "convex", "lido", "rocketpool", "eigenlayer", "ethena",
-            "sky", "dao", "snapshot", "veto", "governance", "treasury",
-            "staking", "stake", "restake", "restaking", "lst", "lrt",
+            "defi", "tvl", "apy", "apr", "yield", "yields", "vault", "vaults",
+            "lp", "amm", "lending", "borrow", "borrowing", "collateral",
+            "stablecoin", "stables", "rebase", "peg", "depeg", "liquidity",
+            "lps", "swap", "uniswap", "aave", "compound", "maker", "dai",
+            "usdc", "usdt", "frax", "curve", "balancer", "morpho", "pendle",
+            "convex", "lido", "rocketpool", "ethena", "sky", "dao", "snapshot",
+            "veto", "governance", "treasury", "mev", "flashloan",
         },
         "phrases": [
             "real yield", "money market", "money markets", "vote escrow",
             "smart contract", "yield farm", "stable pool", "interest rate",
-            "liquid staking",
+            "ve token", "ve tokens", "permissionless lending",
         ],
     },
     "perps": {
@@ -70,97 +72,225 @@ CLASSES: dict[str, dict] = {
         "words": {
             "perp", "perps", "perpetual", "perpetuals", "leverage", "leveraged",
             "long", "longs", "short", "shorts", "longed", "shorted", "longing",
-            "shorting", "funding", "liquidated", "liquidation", "rekt", "stop",
-            "stoploss", "stops", "tp", "sl", "position", "positions", "size",
-            "margin", "isolated", "cross", "hyperliquid", "hl", "drift", "gmx",
+            "shorting", "funding", "liquidated", "liquidation", "rekt",
+            "stoploss", "stops", "tp", "sl", "position", "positions",
+            "margin", "isolated", "hyperliquid", "hl", "drift", "gmx",
             "dydx", "bluefin", "vertex", "synfutures", "apex", "aevo",
-            "lighter", "edgex", "paradex", "ostium", "ranger",
+            "lighter", "edgex", "paradex", "ostium", "ranger", "scalp",
+            "scalping", "swing", "pnl",
         },
         "phrases": [
             "funding rate", "funding rates", "open interest", "long squeeze",
             "short squeeze", "got liquidated", "got rekt", "10x long",
             "10x short", "sized in", "size up", "perp dex", "max long",
-            "max short",
+            "max short", "pnl porn", "stop loss", "took profit",
+        ],
+    },
+    "memecoins": {
+        "label": "Memecoin Casino",
+        "emoji": "🎰",
+        "blurb": "Launches, pumps, drama, rugs.",
+        "words": {
+            "meme", "memes", "memecoin", "memecoins", "pumpfun", "pump",
+            "pumps", "pumped", "pumping", "dump", "dumped", "dumping", "rug",
+            "rugged", "rugpull", "rugged", "shitcoin", "shitcoins", "ape",
+            "aped", "aping", "snipe", "sniped", "sniping", "wif", "bonk",
+            "popcat", "doge", "shib", "pepe", "moodeng", "fartcoin", "trump",
+            "melania", "billy", "chillguy", "goat", "ai16z", "ansem", "hotmom",
+            "neiro", "michi", "moo", "bome", "myro", "smolting",
+        },
+        "phrases": [
+            "pump.fun", "pump fun", "fresh launch", "new launch", "ca:",
+            "contract address", "1 billion mc", "10m mc", "100m mc",
+            "send it", "this is the one", "early call", "moonshot",
+            "to the moon", "low cap gem", "dev sold", "dev rugged",
         ],
     },
     "nft": {
-        "label": "NFT Stream",
+        "label": "NFT Atelier",
         "emoji": "🖼️",
         "blurb": "Mints, floors, collections, jpegs.",
         "words": {
             "nft", "nfts", "mint", "mints", "minted", "minting", "floor",
-            "floors", "jpeg", "jpegs", "pfp", "pfps", "rare", "rarity", "trait",
-            "traits", "1of1", "1/1", "drop", "drops", "dropped", "blueprint",
-            "magiceden", "opensea", "blur", "tensor", "magic", "punks",
-            "cryptopunks", "milady", "ssfn", "redacted", "azuki", "doodles",
-            "pudgy", "remilia", "ordinals", "inscriptions", "runes",
-            "ercnft", "erc721", "erc1155", "openedition",
+            "floors", "jpeg", "jpegs", "pfp", "pfps", "rare", "rarity",
+            "trait", "traits", "drop", "drops", "dropped", "magiceden",
+            "opensea", "blur", "tensor", "punks", "cryptopunks", "milady",
+            "redacted", "azuki", "doodles", "pudgy", "remilia", "ordinals",
+            "inscriptions", "runes", "erc721", "erc1155", "openedition",
+            "highlight", "manifold", "foundation", "superrare",
         },
         "phrases": [
             "floor price", "blue chip", "blue chips", "free mint", "free mints",
             "open edition", "1 of 1", "art block", "art blocks", "sweep the floor",
-            "checks out", "mint pass", "mint price",
-        ],
-    },
-    "trading": {
-        "label": "Trading Floor",
-        "emoji": "🕯️",
-        "blurb": "Charts, setups, levels, calls.",
-        "words": {
-            "ta", "chart", "charts", "candle", "candles", "wick", "wicks",
-            "support", "resistance", "trend", "trendline", "breakout", "breakouts",
-            "breakdown", "pump", "dump", "pumps", "dumps", "rally", "fade",
-            "fades", "scalp", "scalping", "swing", "swings", "hodl", "hodling",
-            "buy", "buying", "sell", "selling", "bid", "ask", "ask",
-            "flag", "wedge", "wedges", "triangle", "ema", "sma", "rsi", "macd",
-            "fib", "fibs", "vpvr", "volume", "vol", "rejection", "reclaim",
-            "reclaims", "tap", "taps", "leg", "legs",
-        },
-        "phrases": [
-            "higher high", "higher low", "lower high", "lower low", "bull flag",
-            "bear flag", "head and shoulders", "double top", "double bottom",
-            "bollinger band", "moving average", "fib retracement", "fib level",
-            "price action", "tape", "the tape", "btc dominance", "alt season",
-            "altcoin season", "risk on", "risk off",
-        ],
-    },
-    "shitposting": {
-        "label": "Shitposting 101",
-        "emoji": "🤡",
-        "blurb": "GMs, copes, frens, lore.",
-        "words": {
-            "gm", "gn", "wagmi", "ngmi", "ser", "fren", "frens", "anon", "anons",
-            "based", "cope", "copium", "hopium", "moon", "mooning", "mooned",
-            "rekt", "absolutely", "literally", "kek", "lmao", "lol", "ratio",
-            "ratiod", "midcurver", "smol", "huge", "gigachad", "chad", "jeet",
-            "jeeted", "jeets", "bagholder", "bag", "bags", "btfd", "fud",
-            "fudding", "shill", "shilling", "shitpost", "shitposting", "shitposter",
-            "alpha", "betas", "uwu", "owo", "lfg", "ngl", "wtf", "tbh",
-            "delulu", "midwit", "smolwit",
-        },
-        "phrases": [
-            "gm fren", "gm frens", "gm anon", "gm ser", "few understand",
-            "have fun staying poor", "we're so back", "it's so over",
-            "this changes everything", "i am so cooked", "we are so back",
-            "based and", "ngmi if", "wagmi if", "this is the way",
+            "mint pass", "mint price", "secondary market", "secondary sales",
         ],
     },
     "prediction": {
         "label": "Prediction Markets",
         "emoji": "🎲",
-        "blurb": "Odds, contracts, markets on outcomes.",
+        "blurb": "Polymarket, Kalshi, odds on everything.",
         "words": {
             "polymarket", "kalshi", "augur", "polymkt", "predictit", "manifold",
-            "limitless", "stake", "wager", "wagering", "wagers", "odds", "edge",
-            "ev", "+ev", "-ev", "yes", "no", "resolve", "resolved", "resolution",
-            "contract", "contracts", "binary", "outcome", "outcomes", "election",
-            "candidate", "primary", "fed", "fomc", "inflation", "cpi", "rate",
-            "ratecut", "halving", "epoch",
+            "limitless", "wager", "wagering", "wagers", "odds", "edge", "ev",
+            "yes", "no", "resolve", "resolved", "resolution", "binary",
+            "outcome", "outcomes", "election", "candidate", "primary", "fomc",
+            "halving", "epoch", "trader",
         },
         "phrases": [
             "prediction market", "prediction markets", "polymarket odds",
             "kalshi market", "expected value", "implied probability",
             "buying yes", "buying no", "implied odds", "buy yes", "buy no",
+            "+ev", "-ev", "fade the public", "sharp money", "kelly criterion",
+        ],
+    },
+    "rwa": {
+        "label": "RWA Desk",
+        "emoji": "🏛️",
+        "blurb": "Real-world assets, tokenization, T-bills.",
+        "words": {
+            "rwa", "rwas", "tokenization", "tokenize", "tokenized", "tokenizing",
+            "ondo", "maple", "centrifuge", "goldfinch", "credix", "blackrock",
+            "blackrocks", "buidl", "tbill", "tbills", "treasuries", "treasury",
+            "treasurybills", "tradfi", "fintech", "credit", "lending",
+            "private", "securitize", "securities", "etf", "etfs", "stocks",
+            "tokenstocks", "stableyield", "yieldcoupon", "coupon", "coupons",
+            "deed", "deeds", "title", "titles", "asset",
+        },
+        "phrases": [
+            "real world assets", "real-world assets", "tokenized treasuries",
+            "tokenized treasury", "tokenized stocks", "tokenized credit",
+            "us treasuries", "money market fund", "private credit",
+            "asset backed", "off chain yield", "off-chain yield",
+        ],
+    },
+    "ai": {
+        "label": "AI × Crypto Lab",
+        "emoji": "🤖",
+        "blurb": "AI agents, autonomous traders, model markets.",
+        "words": {
+            "ai", "agents", "agent", "agentic", "autonomous", "llm", "llms",
+            "gpt", "claude", "anthropic", "openai", "deepseek", "deepmind",
+            "model", "models", "inference", "inferences", "inferencing",
+            "dataset", "datasets", "embedding", "embeddings", "rag", "vector",
+            "bittensor", "tao", "fetch", "ocean", "render", "rndr", "akash",
+            "io", "near", "virtuals", "agi", "asi", "neural", "transformer",
+            "transformers", "diffusion", "fine", "tuning", "finetune",
+            "finetuning", "ai16z", "elizaos", "swarm", "swarms",
+        },
+        "phrases": [
+            "ai agent", "ai agents", "autonomous agent", "autonomous agents",
+            "ai trader", "ai traders", "model marketplace", "compute network",
+            "fine tuning", "fine-tune", "open source ai", "open-source ai",
+            "ai x crypto", "ai meets crypto", "intelligent contract",
+        ],
+    },
+    "airdrops": {
+        "label": "Airdrop Farm",
+        "emoji": "🪂",
+        "blurb": "Points, eligibility, sybil checks, claims.",
+        "words": {
+            "airdrop", "airdrops", "claim", "claims", "claimed", "claiming",
+            "claimable", "points", "point", "ptsfarm", "farm", "farming",
+            "farmed", "farmer", "farmers", "season", "seasons", "epoch",
+            "epochs", "tge", "wallet", "wallets", "sybil", "sybils",
+            "eligibility", "eligible", "eligibility", "snapshot", "snapshots",
+            "linea", "scroll", "zksync", "starknet", "blast", "manta",
+            "berachain", "monad", "movement", "fuel", "hyperliquid", "lido",
+            "ether", "etherfi", "kelp", "renzo", "puffer", "swell",
+        },
+        "phrases": [
+            "points farming", "point farming", "airdrop farm", "farming season",
+            "tge soon", "tge confirmed", "snapshot date", "first farmer",
+            "max farm", "boost multiplier", "referral code", "refer code",
+            "bonus points", "double points", "season 2", "season 3",
+        ],
+    },
+    "socialfi": {
+        "label": "SocialFi Lounge",
+        "emoji": "📡",
+        "blurb": "Creator economy, content monetization in crypto.",
+        "words": {
+            "socialfi", "creator", "creators", "tip", "tips", "tipped",
+            "tipping", "subscriber", "subscribers", "follower", "followers",
+            "monetize", "monetization", "monetized", "monetizing", "audience",
+            "channel", "channels", "stream", "streams", "streaming", "podcast",
+            "podcasts", "newsletter", "newsletters", "subscribe", "patron",
+            "patrons", "supporter", "supporters", "lens", "farcaster", "fcast",
+            "warpcast", "fc", "phaver", "drakula", "rep", "reputation",
+            "engage", "engagement", "infofi", "kaito", "yapper", "yappers",
+            "yap", "yapping",
+        },
+        "phrases": [
+            "creator economy", "content monetization", "social token",
+            "social tokens", "engagement farming", "tip jar", "paid posts",
+            "paid newsletter", "fan token", "fan tokens", "creator coin",
+            "creator coins", "lens protocol", "info-fi", "info fi",
+        ],
+    },
+    "restaking": {
+        "label": "Restaking Lab",
+        "emoji": "🔁",
+        "blurb": "EigenLayer, AVS, LRTs, shared security.",
+        "words": {
+            "restaking", "restake", "restaked", "restakes", "eigenlayer",
+            "eigen", "eigenpod", "eigenpods", "avs", "avses", "operator",
+            "operators", "lst", "lsts", "lrt", "lrts", "lido", "rocketpool",
+            "swell", "renzo", "kelp", "etherfi", "puffer", "altlayer",
+            "stader", "ankr", "redstone", "babylon", "symbiotic", "karak",
+            "kelpdao", "stakestone", "ssv", "ethereum", "validator",
+            "validators", "consensus", "slashing", "slashed",
+        },
+        "phrases": [
+            "liquid staking", "liquid restaking", "shared security",
+            "actively validated", "actively validated services", "av s",
+            "operator set", "operator sets", "restaking points",
+            "restaking yield", "eigen points", "rsETH", "ezETH", "weETH",
+            "operator slashing", "lrt yield",
+        ],
+    },
+    "l2": {
+        "label": "Layer-2 Atelier",
+        "emoji": "🛣️",
+        "blurb": "Rollups, new L1s, scaling, app chains.",
+        "words": {
+            "l2", "l2s", "l1", "l1s", "rollup", "rollups", "optimism", "op",
+            "arbitrum", "arb", "base", "scroll", "linea", "zksync", "zk",
+            "starknet", "stark", "polygon", "matic", "blast", "manta",
+            "mantle", "fraxtal", "kroma", "cyber", "boba", "metis", "celestia",
+            "tia", "monad", "sei", "sui", "aptos", "movement", "berachain",
+            "bera", "fuel", "tonchain", "ton", "kaspa", "kas", "near", "icp",
+            "tron", "trx", "solana", "sol", "appchain", "appchains",
+        },
+        "phrases": [
+            "layer 2", "layer two", "layer 1", "layer one", "data availability",
+            "data-availability", "execution layer", "settlement layer",
+            "modular blockchain", "monolithic chain", "app chain", "app-chain",
+            "shared sequencer", "based rollup", "based rollups", "zk proof",
+            "zk proofs", "validity proof", "fraud proof",
+        ],
+    },
+    "macro": {
+        "label": "Macro × Crypto",
+        "emoji": "🌍",
+        "blurb": "Fed, rates, ETFs, regulation, BTC as macro asset.",
+        "words": {
+            "macro", "fed", "fomc", "powell", "yellen", "treasury", "rate",
+            "rates", "ratecut", "rates", "inflation", "cpi", "ppi", "pce",
+            "gdp", "unemployment", "nfp", "jobs", "recession", "recessions",
+            "qe", "qt", "tapering", "tightening", "easing", "rrp", "tga",
+            "dxy", "spx", "nasdaq", "vix", "etf", "etfs", "ibit", "fbtc",
+            "ethereum", "ether", "spotetf", "spotbtc", "spoteth", "blackrock",
+            "fidelity", "vanguard", "regulation", "regulator", "regulators",
+            "regulating", "regulated", "sec", "cftc", "treasury", "yields",
+            "yield", "stocks", "equities", "bonds", "bond",
+        },
+        "phrases": [
+            "interest rate", "rate cut", "rate cuts", "rate hike", "rate hikes",
+            "balance sheet", "spot etf", "spot etfs", "spot btc etf",
+            "spot eth etf", "fed pivot", "soft landing", "hard landing",
+            "global liquidity", "monetary policy", "fiscal policy",
+            "treasury yields", "10 year", "10-year", "two year", "2-year",
+            "btc as collateral", "btc as macro", "store of value",
         ],
     },
 }
@@ -174,9 +304,9 @@ def _tokenise(text: str) -> set[str]:
 def classify_tweet(text: str) -> set[str]:
     """Return the set of class ids that this tweet matches.
 
-    A tweet may be matched to zero, one or several classes. We don't try to
-    pick a single best class per tweet — counts are aggregated across the
-    user's whole sample.
+    A tweet may be matched to zero, one or several classes. We don't try
+    to pick a single best class per tweet — counts are aggregated across
+    the user's whole sample.
     """
     if not text:
         return set()
@@ -265,4 +395,5 @@ def classify_user(tweet_texts: Iterable[str]) -> dict:
 
 
 def all_class_ids() -> list[str]:
-    return ["general", *CLASSES.keys()]
+    """Returns the stable list of class ids (excluding "general")."""
+    return list(CLASSES.keys())
