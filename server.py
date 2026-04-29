@@ -647,6 +647,22 @@ def _kick_seed_validation(class_id: str) -> None:
     threading.Thread(target=_runner, daemon=True, name=f"seed-validate-{class_id}").start()
 
 
+def _prewarm_all_seeds() -> None:
+    """Kick seed-validation for every class once the server has booted, so
+    avatar URLs are populated by the time the first user opens a classroom.
+    Pre-warm runs entirely in background daemon threads — never blocks
+    startup or any HTTP request."""
+    if not API_KEY:
+        return
+    for cid in list(classmates.all_class_ids()):
+        _kick_seed_validation(cid)
+
+
+# Defer pre-warm by a few seconds so it doesn't compete with the first
+# /health probe Render uses to confirm a successful deploy.
+threading.Timer(3.0, _prewarm_all_seeds).start()
+
+
 @app.get("/api/classmates/<class_id>")
 def classmates_route(class_id: str) -> Any:
     """Return the roster for a class.
@@ -733,6 +749,7 @@ def analyze(username: str) -> Any:
         classification["primary"],
         profile_shaped["userName"] or username,
         profile_shaped["displayName"] or username,
+        profile_shaped.get("avatarUrl") or "",
     )
     _kick_seed_validation(classification["primary"])
 
