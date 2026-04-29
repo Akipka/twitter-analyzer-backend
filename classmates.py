@@ -240,6 +240,7 @@ def _init_rosters() -> None:
                 {
                     "username": s["username"],
                     "displayName": s["displayName"],
+                    "avatarUrl": "",
                     "seeded": True,
                     "addedAt": 0.0,
                 }
@@ -251,12 +252,20 @@ def _init_rosters() -> None:
 _init_rosters()
 
 
-def add_member(class_id: str, username: str, display_name: str) -> None:
+def add_member(
+    class_id: str,
+    username: str,
+    display_name: str,
+    avatar_url: str = "",
+) -> None:
     """Append `username` to `class_id`'s roster.
 
     Deduplicates case-insensitively; if the user is already on the roster,
     they're moved to the front (so freshly-analyzed users appear first).
     Once the roster reaches CLASS_SIZE, oldest non-seed entries are evicted.
+    `avatar_url` is the user's twimg profile_image URL (from
+    twitterapi.io's `profilePicture` field) — emitted directly in the
+    classmates response so the frontend can avoid the unavatar.io proxy.
     """
     if class_id not in _ROSTERS:
         return
@@ -270,6 +279,7 @@ def add_member(class_id: str, username: str, display_name: str) -> None:
         roster.insert(0, {
             "username": username.lstrip("@"),
             "displayName": display_name or username.lstrip("@"),
+            "avatarUrl": avatar_url or "",
             "seeded": False,
             "addedAt": time.time(),
         })
@@ -283,6 +293,22 @@ def add_member(class_id: str, username: str, display_name: str) -> None:
                 # All entries are seeded; just trim from tail.
                 roster.pop()
         _ROSTERS[class_id] = roster
+
+
+def set_member_avatar(class_id: str, username: str, avatar_url: str) -> None:
+    """Update the cached avatarUrl for an existing roster member.
+
+    Called by `validate_class_seeds` after a successful profile lookup so
+    seeded entries pick up their real twimg avatar URL without ever needing
+    to hit our /api/avatar proxy."""
+    if class_id not in _ROSTERS or not avatar_url:
+        return
+    norm = username.lstrip("@").lower()
+    with _LOCK:
+        for r in _ROSTERS[class_id]:
+            if r["username"].lower() == norm:
+                r["avatarUrl"] = avatar_url
+                break
 
 
 def get_roster(class_id: str) -> list[dict]:
@@ -388,6 +414,12 @@ def validate_class_seeds(
         if profile is None:
             log.info("seed_validate: %s is dead, marking", username)
             mark_seed_dead(username)
+            continue
+        # Live seed: pick up the real avatar URL so the frontend can render
+        # it directly without going through the unavatar proxy.
+        avatar_url = profile.get("profilePicture") or profile.get("avatarUrl") or ""
+        if avatar_url:
+            set_member_avatar(class_id, username, avatar_url)
 
 
 def all_class_ids() -> Iterable[str]:
